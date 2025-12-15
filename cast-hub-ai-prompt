@@ -1,0 +1,329 @@
+# Prompt: Generate Cast hub.
+
+
+## Core Architecture
+
+The server implements the Cast hub functionality for managing subscriptions and broadcasting events.
+
+## Environment Configuration
+
+The server should read the following environment variables with defaults:
+- `PORT`: Server port (default: 5000)
+- `HUB_URL`: Hub URL (default: `http://localhost:{PORT}`)
+- `HUB_ENDPOINT`: Hub API endpoint (default: `/api/hub/`)
+- `TITLE`: Application title (default: `'Cast Hub'`)
+- `DEFAULT_CONTEXT`: JSON string with default FHIR context (Patient and ImagingStudy resources)
+
+## Data Structures
+
+Maintain the following in-memory data structures:
+- `subscriptions`: List of subscription objects with properties:
+  - `channel`: `'websub'` or `'websocket'`
+  - `endpoint`: WebSocket URL or callback URL
+  - `websocket_endpoint`: Random endpoint identifier for WebSocket binding
+  - `callback`: Callback URL for WebSub
+  - `events`: Comma-separated string of subscribed event types
+  - `secret`: Shared secret for HMAC verification
+  - `topic`: Session/topic identifier
+  - `lease`: Lease duration in seconds
+  - `session`: Session identifier (same as topic)
+  - `subscriber`: Subscriber application name
+  - `host`: Host header from subscription request
+  - `websocket`: WebSocket connection object (for WebSocket subscriptions)
+- `conferences`: List of conference objects with properties:
+  - `user`: User identifier
+  - `title`: Conference title
+  - `topics`: List of attendee topic identifiers
+- `lastContext`: Dictionary mapping topic/session IDs to their last context state
+- `pageLoads`: Counter for page load requests
+- `userCount`: Counter for user authentication
+- `auditLog`: all messages received
+
+
+## Hub Endpoints
+
+### POST `/api/hub/`
+**Purpose**: Handle subscription and unsubscription requests from clients
+
+**Request Body**: Form data or JSON with keys:
+- `hub.mode`: `'subscribe'` or `'unsubscribe'`
+- `hub.events`: Comma-separated list of event types
+- `hub.callback`: Callback URL (for WebSub)
+- `hub.secret`: Shared secret for HMAC
+- `hub.topic`: Session/topic identifier
+- `hub.lease`: Lease duration in seconds
+- `subscriber.name`: Name of the subscribing application
+- `hub.channel.type`: Optional - `'websocket'` or `'websub'` (defaults to `'websub'` if not provided)
+- `hub.channel.endpoint`: Used for unsubscribe
+
+**Behavior**:
+1. If `hub.channel.type` is not provided, perform WebSub verification:
+   - Call `checkSubscriptionRequest()` to verify the callback URL
+   - Send GET request to `hub.callback` with query params `hub.challenge` and `hub.topic`
+   - Verify the response body matches `hub.secret`
+2. If `hub.channel.type` is `'websocket'`, skip verification
+3. If verification succeeds (status 200 and response matches secret):
+   - Generate random WebSocket endpoint identifier
+   - Determine protocol (`ws:` or `wss:`) based on `HUB_URL`
+   - Create subscription object
+   - If `hub.mode == 'subscribe'`: Add to subscriptions list
+   - If `hub.mode == 'unsubscribe'`: 
+     - Close matching WebSocket connections
+     - Remove matching subscriptions from list
+   - Return 202 with JSON: `{"hub.channel.endpoint": websocket_url}`
+4. If verification fails, return 500
+
+### POST `/api/hub/:topic`
+**Purpose**: Receive events from clients for a specific topic
+
+**URL Parameter**: `topic` - Session/topic identifier
+
+**Request Body**: JSON event object with structure:
+```json
+{
+  "event": {
+    "hub.topic": "session-id",
+    "hub.event": "event-type",
+    "context": {...}
+  }
+}
+```
+
+**Behavior**:
+1. Return 200 immediately
+2. Log the event
+3. Call `sendEvents()` to broadcast to subscribers
+
+### POST `/api/hub/`
+**Purpose**: Receive events from clients (STU3 style, no topic in URL)
+
+**Request Body**: Same as `/api/hub/:topic`
+
+**Behavior**: Same as above
+
+### GET `/api/hub/:topic`
+**Purpose**: Get context for a topic or authenticate user
+
+**URL Parameter**: `topic` - Session/topic identifier or `'authenticate'`
+
+**Query Parameters** (for authenticate):
+- `username`: Username
+- `secret`: Application secret
+
+**Behavior**:
+- If `topic == 'authenticate'`: 
+  - Look up user in database (if implemented)
+  - Return 200 with topic string or 404 with error message
+- Otherwise:
+  - Return 200 with context from `lastContext[topic]` or empty object
+
+### POST `/status`
+**Purpose**: Return hub status information (internal, not part of standard)
+
+**Behavior**:
+1. Build status message with:
+   - Hostname and port
+   - Network interface IP addresses (skip internal/loopback)
+   - Number of connected browsers
+   - Number of active subscriptions
+   - List of subscriptions with subscriber name, topic, and host
+2. Log the status
+3. Return 200
+
+### DELETE `/api/hub/`
+**Purpose**: Clear all subscriptions
+
+**Behavior**:
+1. Close all WebSocket connections in subscriptions
+2. Clear subscriptions list
+3. Log action
+4. Return 200
+
+### WebSocket `/bind/:endpoint`
+**Purpose**: Bind WebSocket connection for event delivery
+
+**URL Parameter**: `endpoint` - WebSocket endpoint identifier
+
+**Behavior**:
+1. Find subscription matching `endpoint` in `websocket_endpoint`
+2. If found and `websocket` is null:
+   - Bind the WebSocket connection to the subscription
+   - Send confirmation message:
+     ```json
+     {
+       "timestamp": "ISO timestamp",
+       "bound": "endpoint-id",
+       "hub.mode": "subscribe",
+       "hub.lease_seconds": 7200
+     }
+     ```
+3. Handle incoming messages:
+   - Parse JSON message
+   - If valid event, call `sendEvents()`
+4. Handle WebSocket close:
+   - Log closure
+
+## UI and Utility Endpoints
+
+### GET `/webmsg/`
+**Purpose**: Serve webmessage.html file
+
+### GET `/websocket/`
+**Purpose**: Serve websocket.html file
+
+### GET `/conference/manage`
+**Purpose**: Serve conference.html file
+
+### GET `/conference`
+**Purpose**: Get list of all conferences
+
+**Response**: JSON array of conference objects
+
+### POST `/conference`
+**Purpose**: Create a new conference
+
+**Request Body**: JSON with `user`, `title`, `topics` (list)
+
+**Behavior**:
+1. Add conference to list
+2. Log conference creation
+3. Return 200
+
+### DELETE `/conference`
+**Purpose**: Delete a conference or remove user from conference
+
+**Request Body**: JSON with `user` identifier
+
+**Behavior**:
+1. If conference.user matches, remove entire conference
+2. If user is in conference.topics, log exit (conference remains)
+3. Return 200
+
+### GET `/topics`
+**Purpose**: Get list of all active topic/session identifiers
+
+**Response**: JSON array of topic strings from subscriptions
+
+### GET `/`
+**Purpose**: Serve main UI page
+
+**Behavior**:
+1. server a page that show number of clients connected, their topic and the audit log.
+
+## Helper Functions
+
+### `checkSubscriptionRequest(subscriptionRequest)`
+**Purpose**: Verify WebSub subscription callback
+
+**Parameters**: Subscription request object
+
+**Behavior**:
+1. Send GET request to `hub.callback` with query params:
+   - `hub.challenge`: `hub.secret` value
+   - `hub.topic`: `hub.topic` value
+2. Return response object with `status` and `data` (response body)
+
+### `sendEvents(notification)`
+**Purpose**: Broadcast event to all matching subscribers
+
+**Parameters**: Event notification object with structure:
+```json
+{
+  "event": {
+    "hub.topic": "session-id",
+    "hub.event": "event-type",
+    "context": {...}
+  }
+}
+```
+
+**Behavior**:
+1. Update `lastContext`:
+   - If event type contains `'close'`, set context to empty object
+   - Otherwise, store context in `lastContext[topic]`
+2. For each subscription:
+   - If subscription matches event type (case-insensitive contains) and session/topic:
+     - Calculate HMAC-SHA256 signature with subscription secret
+     - If channel is `'websocket'`:
+       - Check if WebSocket is open (readyState == 1)
+       - If open, send JSON notification
+       - If closed, remove subscription
+     - If channel is `'websub'`:
+       - Send POST request to callback URL with:
+         - JSON body: notification
+         - Header: `X-Hub-Signature: sha256={hmac_hex}`
+3. For each conference:
+   - If conference.user matches event topic:
+     - For each attendee in conference.topics:
+       - Find subscriptions matching attendee
+       - Send event to their WebSocket connections
+
+
+### `sendWebsocketHeartbeat()`
+**Purpose**: Send heartbeat messages to all WebSocket subscriptions
+
+**Behavior**:
+1. For each subscription with channel `'websocket'`:
+   - Create heartbeat payload:
+     ```json
+     {
+       "timestamp": "ISO timestamp",
+       "id": "CAST-HUB",
+       "event": {
+         "hub.topic": subscription.topic,
+         "hub.event": "heartbeat"
+       }
+     }
+     ```
+   - Send via WebSocket
+   - On error, remove subscription
+2. Schedule to run every 15 seconds
+
+## Static File Serving
+
+
+## CORS Configuration
+
+Set headers:
+- `Access-Control-Allow-Origin: *`
+- `Access-Control-Allow-Headers: Origin, X-Requested-With, Content-Type, Accept, Authorization`
+- `Cross-Origin-Opener-Policy: same-origin`
+- `Cross-Origin-Embedder-Policy: require-corp`
+
+### POST `/oauth/token`
+**Purpose**: OAuth token endpoint for testing
+
+**Response**: JSON with:
+- `token_type`: `"Bearer"`
+- `expires_in`: `3600`
+- `scope`: `"openid"`
+- `topic`: `"user-{userCount}"` (incremented each call)
+- `id_token`: Mock token string
+- `access_token`: Mock token string
+
+## Implementation Requirements
+
+1. Use Flask with Flask-SocketIO or FastAPI with WebSocket support
+2. Implement all endpoints with exact behavior described above
+3. Maintain in-memory data structures (no database required for basic functionality)
+4. Support both WebSub and WebSocket channels
+5. Implement HMAC-SHA256 signature verification for WebSub
+6. Handle WebSocket connection lifecycle (open, message, close)
+7. Implement heartbeat mechanism (every 15 seconds)
+8. Support CORS headers
+9. Log all operations using themethod of the server
+10. Serve static HTML files from the same directory
+11. Support environment variable configuration
+
+## Error Handling
+
+- Return appropriate HTTP status codes (200, 202, 404, 500)
+- Handle WebSocket connection errors gracefully
+- Remove dead subscriptions automatically
+- Log all errors and important operations
+
+## Notes
+- All timestamps should use ISO 8601 format
+- Event matching is case-insensitive for event types
+- WebSocket readyState: 1 = OPEN, 0 = CONNECTING, 2 = CLOSING, 3 = CLOSED
+
